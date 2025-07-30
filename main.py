@@ -4,7 +4,7 @@ import zeep
 
 app = FastAPI()
 
-# WSDL de The Factory HKA
+# WSDL de The Factory HKA (demo)
 wsdl = 'https://demoemision.thefactoryhka.com.pa/ws/obj/v1.0/Service.svc?singleWsdl'
 
 @app.post("/enviar-factura")
@@ -25,7 +25,7 @@ async def enviar_factura(request: Request):
 @app.post("/descargar-pdf")
 async def descargar_pdf(request: Request):
     datos = await request.json()
-    # Asegurar que se incluyan los tokens
+    # Agregar tokens obligatorios
     datos['tokenEmpresa'] = "hqavyygdygrn_tfhka"
     datos['tokenPassword'] = "@&Si-&7m/,dy"
     try:
@@ -36,3 +36,4 @@ async def descargar_pdf(request: Request):
     except Exception as e:
         print("ERROR:", e)
         return JSONResponse({"error": str(e)}, status_code=500)
+
