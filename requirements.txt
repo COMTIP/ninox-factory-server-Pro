@@ -4,3 +4,5 @@ requests
 python-multipart
 zeep
 lxml
+openpyxl
+pandas
