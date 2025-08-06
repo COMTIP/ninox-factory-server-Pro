@@ -32,19 +32,16 @@ async def descargar_pdf(request: Request):
     try:
         cliente = zeep.Client(wsdl=wsdl)
         res = cliente.service.DescargaPDF(**datos)
-        print("RESPUESTA DescargaPDF:", res)  # Log para debug
-
+        print("RESPUESTA DescargaPDF:", res)
         pdf_base64 = res.get('archivoPDF') or res.get('pdf') or None
         if not pdf_base64:
-            # Devuelve el detalle completo de la respuesta del WS para fácil debug en frontend
             return JSONResponse(
                 {
                     "error": "No se recibió archivo PDF.",
-                    "detalle_respuesta": res  # Aquí ves el error real del webservice
+                    "detalle_respuesta": res
                 },
                 status_code=404
             )
-
         filename = "factura_dgi.pdf"
         with open(filename, "wb") as f:
             f.write(base64.b64decode(pdf_base64))
@@ -52,6 +49,7 @@ async def descargar_pdf(request: Request):
     except Exception as e:
         print("ERROR EN PDF:", e)
         return JSONResponse({"error": str(e)}, status_code=500)
+
 
 
 
