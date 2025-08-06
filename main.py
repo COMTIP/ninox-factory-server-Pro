@@ -18,7 +18,7 @@ async def enviar_factura(request: Request):
     try:
         cliente = zeep.Client(wsdl=wsdl)
         res = cliente.service.Enviar(**datos)
-        print("RESPUESTA REAL DEL WEBSERVICE.", res)
+        print("RESPUESTA REAL DEL WEBSERVICE:", res)
         return JSONResponse({"respuesta": str(res)})
     except Exception as e:
         print("ERROR:", e)
@@ -32,10 +32,19 @@ async def descargar_pdf(request: Request):
     try:
         cliente = zeep.Client(wsdl=wsdl)
         res = cliente.service.DescargaPDF(**datos)
-        # El PDF viene codificado en base64, lo decodificamos y lo guardamos temporalmente
+        print("RESPUESTA DescargaPDF:", res)  # Log para debug
+
         pdf_base64 = res.get('archivoPDF') or res.get('pdf') or None
-        if pdf_base64 is None:
-            return JSONResponse({"error": "No se recibió archivo PDF."}, status_code=404)
+        if not pdf_base64:
+            # Devuelve el detalle completo de la respuesta del WS para fácil debug en frontend
+            return JSONResponse(
+                {
+                    "error": "No se recibió archivo PDF.",
+                    "detalle_respuesta": res  # Aquí ves el error real del webservice
+                },
+                status_code=404
+            )
+
         filename = "factura_dgi.pdf"
         with open(filename, "wb") as f:
             f.write(base64.b64decode(pdf_base64))
@@ -43,5 +52,6 @@ async def descargar_pdf(request: Request):
     except Exception as e:
         print("ERROR EN PDF:", e)
         return JSONResponse({"error": str(e)}, status_code=500)
+
 
 
