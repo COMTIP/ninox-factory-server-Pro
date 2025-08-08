@@ -1,32 +1,33 @@
+# app.py
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os, base64, tempfile
 import zeep
 from zeep.helpers import serialize_object
-from dotenv import load_dotenv  # para cargar .env en local
 
-# Cargar .env en local (en producción Render/Railway ya tienes env vars)
-load_dotenv()
+# ========= CONFIG =========
+# Usa env vars si existen; si no, usa los valores por defecto que pasaste
+WSDL = os.getenv(
+    "THEFACTORY_WSDL",
+    "https://demoemision.thefactoryhka.com.pa/ws/obj/v1.0/Service.svc?singleWsdl"
+)
+TOKEN_EMPRESA  = os.getenv("THEFACTORY_TOKEN_EMPRESA") or "hqavyydgygrn_tfhka"
+TOKEN_PASSWORD = os.getenv("THEFACTORY_TOKEN_PASSWORD") or "@&Si-&7m/,dy"
 
-app = FastAPI()
+# Reusar el cliente SOAP
+soap_client = zeep.Client(wsdl=WSDL)
+
+app = FastAPI(title="Ninox-TheFactory Bridge")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ajusta a tu dominio en prod
+    allow_origins=["*"],  # en prod: pon tu dominio
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ========= CONFIG =========
-WSDL            = os.getenv("THEFACTORY_WSDL", "https://demoemision.thefactoryhka.com.pa/ws/obj/v1.0/Service.svc?singleWsdl")
-TOKEN_EMPRESA   = os.getenv("THEFACTORY_TOKEN_EMPRESA")
-TOKEN_PASSWORD  = os.getenv("THEFACTORY_TOKEN_PASSWORD")
-
-# Reusar cliente SOAP
-soap_client = zeep.Client(wsdl=WSDL)
-
-# ========= HELPERS ========
+# ========= HELPERS =========
 def to_dict(res):
     try:
         return serialize_object(res)
@@ -37,6 +38,7 @@ def to_dict(res):
             return {"raw": str(res)}
 
 def extract_uuid(d):
+    """Intenta encontrar uuid/claveAcceso/idTransaccion en cualquier parte de la respuesta."""
     if not isinstance(d, dict):
         return None
     keys = ["uuid","UUID","claveAcceso","cufe","CUFE","idTransaccion","id","claveAutorizacion","clave"]
@@ -45,7 +47,7 @@ def extract_uuid(d):
             return d[k]
     for v in d.values():
         if isinstance(v, dict):
-            got = extract_uuid(v); 
+            got = extract_uuid(v)
             if got: return got
         elif isinstance(v, list):
             for it in v:
@@ -55,6 +57,7 @@ def extract_uuid(d):
     return None
 
 def decode_pdf_from_response(res_dict):
+    """Busca el PDF en base64 en llaves comunes."""
     keys = ["archivoPDF","archivo","pdf","documento","contenido","ArchivoPDF","Archivo","PDF"]
     for k in keys:
         if k in res_dict and res_dict[k]:
@@ -65,11 +68,12 @@ def decode_pdf_from_response(res_dict):
             if got: return got
     return None
 
-# ========= ENDPOINTS ======
+# ========= ENDPOINTS =========
 @app.post("/enviar-factura")
 async def enviar_factura(request: Request):
     """
-    Espera: {"documento": {...}}
+    Espera: {"documento": {...}} (estructura de TheFactory)
+    Devuelve: {"ok": True, "respuesta": <dict>, "uuid": "<id o clave>"}
     """
     body = await request.json()
     doc = body.get("documento")
@@ -89,13 +93,28 @@ async def enviar_factura(request: Request):
 
 @app.post("/descargar-pdf")
 async def descargar_pdf(request: Request):
-    body = await request.json()
-    uuid = body.get("uuid") or body.get("claveAcceso") or body.get("idTransaccion")
+    """
+    Modo 1 (preferido): por UUID
+      Payload: {"uuid":"...", "documento":{"tipoDocumento":"01"}}
 
-    # Modo 1: por UUID
+    Modo 2 (fallback): por número de documento
+      Payload: {"datosDocumento":{
+                  "codigoSucursalEmisor":"0000",
+                  "numeroDocumentoFiscal":"00000001",
+                  "puntoFacturacionFiscal":"001",
+                  "tipoDocumento":"01",
+                  "tipoEmision":"01",
+                  "serialDispositivo":""
+               }}
+    """
+    body = await request.json()
+
+    # 1) Por UUID
+    uuid = body.get("uuid") or body.get("claveAcceso") or body.get("idTransaccion")
     if uuid:
         tipo_doc = body.get("documento", {}).get("tipoDocumento", "01")
         try:
+            # Algunos WSDL usan Descargar; otros, ObtenerCAFE
             try:
                 res = soap_client.service.Descargar(
                     tokenEmpresa=TOKEN_EMPRESA,
@@ -115,7 +134,8 @@ async def descargar_pdf(request: Request):
             res_dict = to_dict(res)
             pdf_b64 = decode_pdf_from_response(res_dict)
             if not pdf_b64:
-                return JSONResponse({"error":"El servicio no devolvió PDF","respuesta":res_dict}, status_code=502)
+                return JSONResponse({"error": "El servicio no devolvió PDF", "respuesta": res_dict}, status_code=502)
+
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(base64.b64decode(pdf_b64))
                 path = tmp.name
@@ -123,11 +143,12 @@ async def descargar_pdf(request: Request):
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
-    # Modo 2: por número
+    # 2) Por número de documento (DescargaPDF / DescargarPDF)
     d = body.get("datosDocumento", body)
     numero = d.get("numeroDocumentoFiscal")
     if not numero:
-        return JSONResponse({"error":"Falta 'uuid' o 'datosDocumento.numeroDocumentoFiscal'"}, status_code=400)
+        return JSONResponse({"error": "Falta 'uuid' o 'datosDocumento.numeroDocumentoFiscal'"}, status_code=400)
+
     datos = {
         "tokenEmpresa": TOKEN_EMPRESA,
         "tokenPassword": TOKEN_PASSWORD,
@@ -141,14 +162,17 @@ async def descargar_pdf(request: Request):
         }
     }
     try:
+        # Algunos WSDL lo tienen como DescargaPDF (sin 'r'), otros DescargarPDF
         try:
             res = soap_client.service.DescargaPDF(**datos)
         except Exception:
             res = soap_client.service.DescargarPDF(**datos)
+
         res_dict = to_dict(res)
         pdf_b64 = decode_pdf_from_response(res_dict)
         if not pdf_b64:
-            return JSONResponse({"error":"No se recibió archivo PDF","detalle_respuesta":res_dict}, status_code=404)
+            return JSONResponse({"error": "No se recibió archivo PDF", "detalle_respuesta": res_dict}, status_code=404)
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(base64.b64decode(pdf_b64))
             path = tmp.name
@@ -158,12 +182,14 @@ async def descargar_pdf(request: Request):
 
 @app.get("/")
 def health():
-    return {"status":"ok"}
+    return {"status": "ok"}
 
-# Ejecución local
+# Ejecutar local: uvicorn app:app --reload
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
+
 
 
 
