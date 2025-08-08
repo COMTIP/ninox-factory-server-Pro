@@ -1,69 +1,171 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+import os, base64, tempfile
 import zeep
-import base64
-import tempfile
-import os
+from zeep.helpers import serialize_object
+from dotenv import load_dotenv  # para cargar .env en local
+
+# Cargar .env en local (en producción Render/Railway ya tienes env vars)
+load_dotenv()
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # ajusta a tu dominio en prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# DATOS DEL WS Y CREDENCIALES (pon los tuyos)
-wsdl = 'https://demoemision.thefactoryhka.com.pa/ws/obj/v1.0/Service.svc?singleWsdl'
-TOKEN_EMPRESA = "hqavyydgygrn_tfhka"
-TOKEN_PASSWORD = "@&Si-&7m/,dy"
+# ========= CONFIG =========
+WSDL            = os.getenv("THEFACTORY_WSDL", "https://demoemision.thefactoryhka.com.pa/ws/obj/v1.0/Service.svc?singleWsdl")
+TOKEN_EMPRESA   = os.getenv("THEFACTORY_TOKEN_EMPRESA")
+TOKEN_PASSWORD  = os.getenv("THEFACTORY_TOKEN_PASSWORD")
 
+# Reusar cliente SOAP
+soap_client = zeep.Client(wsdl=WSDL)
+
+# ========= HELPERS ========
+def to_dict(res):
+    try:
+        return serialize_object(res)
+    except Exception:
+        try:
+            return dict(res)
+        except Exception:
+            return {"raw": str(res)}
+
+def extract_uuid(d):
+    if not isinstance(d, dict):
+        return None
+    keys = ["uuid","UUID","claveAcceso","cufe","CUFE","idTransaccion","id","claveAutorizacion","clave"]
+    for k in keys:
+        if k in d and d[k]:
+            return d[k]
+    for v in d.values():
+        if isinstance(v, dict):
+            got = extract_uuid(v); 
+            if got: return got
+        elif isinstance(v, list):
+            for it in v:
+                if isinstance(it, dict):
+                    got = extract_uuid(it)
+                    if got: return got
+    return None
+
+def decode_pdf_from_response(res_dict):
+    keys = ["archivoPDF","archivo","pdf","documento","contenido","ArchivoPDF","Archivo","PDF"]
+    for k in keys:
+        if k in res_dict and res_dict[k]:
+            return res_dict[k]
+    for v in res_dict.values():
+        if isinstance(v, dict):
+            got = decode_pdf_from_response(v)
+            if got: return got
+    return None
+
+# ========= ENDPOINTS ======
 @app.post("/enviar-factura")
 async def enviar_factura(request: Request):
-    datos = await request.json()
-    datos['tokenEmpresa'] = TOKEN_EMPRESA
-    datos['tokenPassword'] = TOKEN_PASSWORD
+    """
+    Espera: {"documento": {...}}
+    """
+    body = await request.json()
+    doc = body.get("documento")
+    if not doc:
+        return JSONResponse({"ok": False, "error": "Falta 'documento' en payload"}, status_code=400)
     try:
-        cliente = zeep.Client(wsdl=wsdl)
-        res = cliente.service.Enviar(**datos)
-        print("RESPUESTA REAL DEL WEBSERVICE:", res)
-        return JSONResponse({"respuesta": str(res)})
+        res = soap_client.service.Enviar(
+            tokenEmpresa=TOKEN_EMPRESA,
+            tokenPassword=TOKEN_PASSWORD,
+            documento=doc
+        )
+        res_dict = to_dict(res)
+        uid = extract_uuid(res_dict)
+        return JSONResponse({"ok": True, "respuesta": res_dict, "uuid": uid})
     except Exception as e:
-        print("ERROR:", e)
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 @app.post("/descargar-pdf")
 async def descargar_pdf(request: Request):
-    # Payload flexible: acepta tanto datosDocumento como plano
     body = await request.json()
-    datos_documento = body.get("datosDocumento", body)
+    uuid = body.get("uuid") or body.get("claveAcceso") or body.get("idTransaccion")
+
+    # Modo 1: por UUID
+    if uuid:
+        tipo_doc = body.get("documento", {}).get("tipoDocumento", "01")
+        try:
+            try:
+                res = soap_client.service.Descargar(
+                    tokenEmpresa=TOKEN_EMPRESA,
+                    tokenPassword=TOKEN_PASSWORD,
+                    uuid=uuid,
+                    tipoDocumento=tipo_doc,
+                    formato="PDF"
+                )
+            except Exception:
+                res = soap_client.service.ObtenerCAFE(
+                    tokenEmpresa=TOKEN_EMPRESA,
+                    tokenPassword=TOKEN_PASSWORD,
+                    uuid=uuid,
+                    tipoDocumento=tipo_doc,
+                    formato="PDF"
+                )
+            res_dict = to_dict(res)
+            pdf_b64 = decode_pdf_from_response(res_dict)
+            if not pdf_b64:
+                return JSONResponse({"error":"El servicio no devolvió PDF","respuesta":res_dict}, status_code=502)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(base64.b64decode(pdf_b64))
+                path = tmp.name
+            return FileResponse(path, media_type="application/pdf", filename=f"factura_{uuid}.pdf")
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    # Modo 2: por número
+    d = body.get("datosDocumento", body)
+    numero = d.get("numeroDocumentoFiscal")
+    if not numero:
+        return JSONResponse({"error":"Falta 'uuid' o 'datosDocumento.numeroDocumentoFiscal'"}, status_code=400)
     datos = {
         "tokenEmpresa": TOKEN_EMPRESA,
         "tokenPassword": TOKEN_PASSWORD,
         "datosDocumento": {
-            "codigoSucursalEmisor": datos_documento.get("codigoSucursalEmisor", "0000"),
-            "numeroDocumentoFiscal": datos_documento.get("numeroDocumentoFiscal"),
-            "puntoFacturacionFiscal": datos_documento.get("puntoFacturacionFiscal", "001"),
-            "tipoDocumento": datos_documento.get("tipoDocumento", "01"),
-            "tipoEmision": datos_documento.get("tipoEmision", "01"),
-            "serialDispositivo": datos_documento.get("serialDispositivo", "")
+            "codigoSucursalEmisor": d.get("codigoSucursalEmisor", "0000"),
+            "numeroDocumentoFiscal": numero,
+            "puntoFacturacionFiscal": d.get("puntoFacturacionFiscal", "001"),
+            "tipoDocumento": d.get("tipoDocumento", "01"),
+            "tipoEmision": d.get("tipoEmision", "01"),
+            "serialDispositivo": d.get("serialDispositivo", "")
         }
     }
     try:
-        cliente = zeep.Client(wsdl=wsdl)
-        res = cliente.service.DescargaPDF(**datos)
-        print("RESPUESTA DescargaPDF:", res)
-        pdf_base64 = res.get('archivoPDF') or res.get('pdf') or None
-        if not pdf_base64:
-            return JSONResponse(
-                {
-                    "error": "No se recibió archivo PDF.",
-                    "detalle_respuesta": res
-                },
-                status_code=404
-            )
-        # Guardar archivo PDF temporal
+        try:
+            res = soap_client.service.DescargaPDF(**datos)
+        except Exception:
+            res = soap_client.service.DescargarPDF(**datos)
+        res_dict = to_dict(res)
+        pdf_b64 = decode_pdf_from_response(res_dict)
+        if not pdf_b64:
+            return JSONResponse({"error":"No se recibió archivo PDF","detalle_respuesta":res_dict}, status_code=404)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(base64.b64decode(pdf_base64))
-            tmp_path = tmp.name
-        return FileResponse(tmp_path, media_type='application/pdf', filename="factura_dgi.pdf")
+            tmp.write(base64.b64decode(pdf_b64))
+            path = tmp.name
+        return FileResponse(path, media_type="application/pdf", filename=f"factura_{numero}.pdf")
     except Exception as e:
-        print("ERROR EN PDF:", e)
         return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/")
+def health():
+    return {"status":"ok"}
+
+# Ejecución local
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
+
 
 
 
